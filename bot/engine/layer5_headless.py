@@ -1,12 +1,15 @@
 """
-LinkBypass Pro - Layer 5: Stealth Playwright Browser v4.1
-==========================================================
+LinkBypass Pro - Layer 5: Stealth Playwright Browser v4.2-jugaad
+================================================================
 Real Chromium browser with Xvfb virtual display:
 - Starts Xvfb on-demand for headed mode (beats CF detection)
 - Falls back to headless if Xvfb unavailable
 - CF managed challenge auto-wait (up to 45s)
 - AdLinkFly flow automation (timer wait + button click)
 - Network interception for destination URL detection
+- JUGAAD: "Bypass All Shortlinks (Debloated)" userscript injected into
+  every page (279 site-specific handlers: timers, auto-click, link
+  extraction). The page drives itself; we watch page.url for the result.
 """
 
 import re
@@ -14,6 +17,7 @@ import os
 import logging
 import asyncio
 import subprocess
+import pathlib
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -64,6 +68,31 @@ Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
 Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
 """
 
+# ── Bypass-All-Shortlinks userscript integration (jugaad) ──────────────────
+# 279 site-specific bypass handlers (timers, auto-click, link extraction)
+# running live inside the Playwright page via add_init_script, with the
+# Violentmonkey GM_* APIs shimmed (see bot/engine/userscript/shim.js).
+# The page drives itself through the shortener flow; we just watch
+# page.url for the destination.
+_USERSCRIPT_DIR = pathlib.Path(__file__).resolve().parent / "userscript"
+_USERSCRIPT_BUNDLE: Optional[str] = None
+
+
+def _get_userscript_bundle() -> str:
+    """Load shim.js + bypass_all_shortlinks.js once. Returns '' if missing."""
+    global _USERSCRIPT_BUNDLE
+    if _USERSCRIPT_BUNDLE is None:
+        try:
+            shim = (_USERSCRIPT_DIR / "shim.js").read_text(encoding="utf-8")
+            js = (_USERSCRIPT_DIR / "bypass_all_shortlinks.js").read_text(encoding="utf-8")
+            _USERSCRIPT_BUNDLE = shim + "\n;\n" + js
+            logger.info(f"[Layer5] Userscript bundle loaded ({len(_USERSCRIPT_BUNDLE) // 1024} KB)")
+        except Exception as e:
+            logger.warning(f"[Layer5] Userscript not found ({e}); continuing without it")
+            _USERSCRIPT_BUNDLE = ""
+    return _USERSCRIPT_BUNDLE
+
+
 _xvfb_proc = None
 _xvfb_display = None
 
@@ -113,6 +142,21 @@ def _is_dest(url: str, src_domain: str) -> bool:
                      and not any(bl in d for bl in ['cloudflare', 'google-analytics', 'adsense']))
     except Exception:
         return False
+
+
+async def _scan_pages_for_dest(context, original_domain) -> Optional[str]:
+    """Check the main page and any popup tabs for a destination URL."""
+    try:
+        pages = context.pages
+    except Exception:
+        return None
+    for p in pages:
+        try:
+            if _is_dest(p.url, original_domain):
+                return p.url
+        except Exception:
+            continue
+    return None
 
 
 async def _wait_for_cf(page, timeout_sec=45):
@@ -191,6 +235,16 @@ async def attempt(url: str) -> Optional[str]:
         )
 
         await context.add_init_script(STEALTH_SCRIPT)
+
+        # ── JUGAAD: inject the Bypass-All-Shortlinks userscript ──────────
+        # 279 site-specific handlers self-dispatch per domain and drive the
+        # page (timers, auto-click, link extraction). GM_* APIs are shimmed.
+        us_bundle = _get_userscript_bundle()
+        us_active = bool(us_bundle)
+        if us_active:
+            await context.add_init_script(us_bundle)
+            logger.info("[Layer5] Userscript injected (279 site handlers)")
+
         page = await context.new_page()
 
         destinations = []
@@ -223,6 +277,26 @@ async def attempt(url: str) -> Optional[str]:
 
             if _is_dest(page.url, original_domain):
                 return page.url
+
+            # ── JUGAAD PHASE: let the userscript drive the page ──────────
+            # The injected script auto-handles timers/buttons per site, so
+            # instead of guessing, we watch for the URL to leave the
+            # shortener domain (main page or any popup tab).
+            if us_active:
+                logger.info("[Layer5] Userscript phase: watching for navigation (~60s)...")
+                for _ in range(20):
+                    await page.wait_for_timeout(3000)
+                    if _is_dest(page.url, original_domain):
+                        logger.info(f"[Layer5] Userscript reached: {page.url[:80]}")
+                        return page.url
+                    found = await _scan_pages_for_dest(context, original_domain)
+                    if found:
+                        logger.info(f"[Layer5] Userscript reached (popup): {found[:80]}")
+                        return found
+                if destinations:
+                    logger.info(f"[Layer5] Userscript phase: using seen destination")
+                    return destinations[-1]
+                logger.info("[Layer5] Userscript phase timed out, falling back to generic flow")
 
             # Post-CF: we should be on the shortener page
             await page.wait_for_timeout(2000)
